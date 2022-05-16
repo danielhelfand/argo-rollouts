@@ -1,13 +1,20 @@
 package get
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/printers"
+	"k8s.io/kubectl/pkg/cmd/get"
+	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/argoproj/argo-rollouts/pkg/kubectl-argo-rollouts/info"
@@ -107,11 +114,12 @@ type GetOptions struct {
 // NewCmdGet returns a new instance of an `rollouts get` command
 func NewCmdGet(o *options.ArgoRolloutsOptions) *cobra.Command {
 	var cmd = &cobra.Command{
-		Use:          "get <rollout|experiment> RESOURCE_NAME",
-		Short:        "Get details about rollouts and experiments",
-		Long:         getUsage,
-		Example:      o.Example(getExample),
-		SilenceUsage: true,
+		Use:               "get <rollout|experiment> RESOURCE_NAME",
+		Short:             "Get details about rollouts and experiments",
+		Long:              getUsage,
+		Example:           o.Example(getExample),
+		SilenceUsage:      true,
+		ValidArgsFunction: RolloutResourceNameCompletionFunc(cmdutil.NewFactory(o.ConfigFlags)),
 		RunE: func(c *cobra.Command, args []string) error {
 			return o.UsageErr(c)
 		},
@@ -184,4 +192,101 @@ func getPrefixes(isLast bool, subPrefix string) (string, string) {
 		childSubpfx = subPrefix + "   "
 	}
 	return childPrefix, childSubpfx
+}
+
+func RolloutResourceNameCompletionFunc(f cmdutil.Factory) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	return func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		var comps []string
+		directive := cobra.ShellCompDirectiveNoFileComp
+		if len(args) == 0 {
+			comps, directive = doRolloutResourceCompletion(f, cmd, toComplete)
+		}
+		return comps, directive
+	}
+}
+
+func doRolloutResourceCompletion(f cmdutil.Factory, cmd *cobra.Command, toComplete string) ([]string, cobra.ShellCompDirective) {
+	var comps []string
+	directive := cobra.ShellCompDirectiveNoFileComp
+	slashIdx := strings.Index(toComplete, "/")
+	if slashIdx == -1 {
+		// Standard case, complete pod names
+		comps = CompGetResource(f, cmd, "rollout", toComplete)
+
+		// Also include resource choices for the <type>/<name> form,
+		// but only for resources that contain pods
+		resourcesWithPods := []string{"rollouts"}
+
+		if len(comps) == 0 {
+			// If there are no pods to complete, we will only be completing
+			// <type>/.  We should disable adding a space after the /.
+			directive |= cobra.ShellCompDirectiveNoSpace
+		}
+
+		for _, resource := range resourcesWithPods {
+			if strings.HasPrefix(resource, toComplete) {
+				comps = append(comps, fmt.Sprintf("%s/", resource))
+			}
+		}
+	} else {
+		// Dealing with the <type>/<name> form, use the specified resource type
+		resourceType := toComplete[:slashIdx]
+		toComplete = toComplete[slashIdx+1:]
+		nameComps := CompGetResource(f, cmd, resourceType, toComplete)
+		for _, c := range nameComps {
+			comps = append(comps, fmt.Sprintf("%s/%s", resourceType, c))
+		}
+	}
+	return comps, directive
+}
+
+func CompGetResource(f cmdutil.Factory, cmd *cobra.Command, resourceName string, toComplete string) []string {
+	template := "{{ range .items  }}{{ .metadata.name }} {{ end }}"
+	return CompGetFromTemplate(&template, f, "", cmd, []string{resourceName}, toComplete)
+}
+
+// CompGetFromTemplate executes a Get operation using the specified template and args and returns the results
+// which begin with `toComplete`.
+func CompGetFromTemplate(template *string, f cmdutil.Factory, namespace string, cmd *cobra.Command, args []string, toComplete string) []string {
+	buf := new(bytes.Buffer)
+	streams := genericclioptions.IOStreams{In: os.Stdin, Out: buf, ErrOut: ioutil.Discard}
+	o := get.NewGetOptions("kubectl", streams)
+
+	// Get the list of names of the specified resource
+	o.PrintFlags.TemplateFlags.GoTemplatePrintFlags.TemplateArgument = template
+	format := "go-template"
+	o.PrintFlags.OutputFormat = &format
+
+	// Do the steps Complete() would have done.
+	// We cannot actually call Complete() or Validate() as these function check for
+	// the presence of flags, which, in our case won't be there
+	if namespace != "" {
+		o.Namespace = namespace
+		o.ExplicitNamespace = true
+	} else {
+		var err error
+		o.Namespace, o.ExplicitNamespace, err = f.ToRawKubeConfigLoader().Namespace()
+		if err != nil {
+			return nil
+		}
+	}
+
+	o.ToPrinter = func(mapping *meta.RESTMapping, outputObjects *bool, withNamespace bool, withKind bool) (printers.ResourcePrinterFunc, error) {
+		printer, err := o.PrintFlags.ToPrinter()
+		if err != nil {
+			return nil, err
+		}
+		return printer.PrintObj, nil
+	}
+
+	o.Run(f, cmd, args)
+
+	var comps []string
+	resources := strings.Split(buf.String(), " ")
+	for _, res := range resources {
+		if res != "" && strings.HasPrefix(res, toComplete) {
+			comps = append(comps, res)
+		}
+	}
+	return comps
 }
